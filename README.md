@@ -57,18 +57,16 @@ now-playing title.
 
 ## Known issues
 
-- **The radio sometimes stutters and then goes completely silent after
-  running for a while**, even with zero rewind applied and the whole
-  signal chain (this daemon, gst-launch, PulseAudio's sink-input, the
-  PulseAudio sink, the ALSA hardware mixer, the raw kernel PCM clock, and
-  the actual decoded-audio level) all still reporting perfectly healthy at
-  the exact moment it goes silent. Root cause not found despite extensive
-  live debugging — looks like something below PulseAudio entirely (a
-  hardware/amp-enable gate, or an LG-proprietary audio-routing policy) that
-  isn't visible through any ALSA/PulseAudio/`/proc` interface. **Fix:
-  toggle green off then on** — a full restart of the audio connection
-  reliably recovers it, and your rewind position is preserved across that
-  restart so you don't lose your sync.
+None currently open on the radio side — see `TODO.md` for the history of
+what used to go wrong (VBR rate-pacing drift, duplicate button listeners,
+and a stutter + ~10s rewind latency caused by `fdsrc`'s timestamps plus
+this TV's heavy CPU contention from F1TV's own video decode), all fixed.
+If the radio ever does stall, toggle green off then on — a full restart of
+the audio connection recovers it, and your rewind position is preserved
+across that restart.
+
+F1TV's own video stream can still occasionally crash the app on start,
+same pre-existing issue as `f1tv-webos` — just reopen, works on retry.
 
 ## Login autofill
 
