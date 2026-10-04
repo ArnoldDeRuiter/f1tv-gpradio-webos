@@ -71,6 +71,20 @@ NUDGE_LARGE_SECONDS = 5.0
 MAX_RETAINED_SECONDS = 120
 MAX_RETAINED_BYTES = MAX_RETAINED_SECONDS * AUDIO_BYTES_PER_SECOND
 
+# Workaround, not a fix: audio reliably goes silent after roughly a minute
+# of play, confirmed live and repeatedly -- every layer we can inspect
+# (this process, gst-launch's own stderr, a `level` meter on the decoded
+# audio, PulseAudio's sink-input, PulseAudio's sink, the ALSA hardware
+# mixer, the raw kernel PCM clock, com.webos.audio, and webOS's own
+# structured notification log) reports perfectly healthy at the exact
+# moment it goes silent -- see TODO.md for the full investigation. A full
+# restart of the gst-launch subprocess reliably recovers it, so this
+# restarts proactively before that point rather than waiting to notice and
+# press green. The rewind/seek position survives the restart (see
+# start()'s _preserved_lag_seconds handling), so this is just a brief,
+# periodic re-connection, not a loss of sync.
+AUTO_RESTART_INTERVAL_SECONDS = 30
+
 GST_LOG_PATH = "/tmp/f1tvgpradio-gst.log"
 MONITOR_INTERVAL_SECONDS = 2
 
@@ -483,7 +497,9 @@ class RadioProcess:
         even if the feed loop itself looks perfectly healthy throughout
         (confirmed live: it did, during a real stutter -- the fault must be
         downstream of our write() calls, in gst/PulseAudio/ALSA, not in the
-        feeder itself)."""
+        feeder itself). Also proactively restarts the subprocess on a timer
+        -- see AUTO_RESTART_INTERVAL_SECONDS."""
+        started_at = time.monotonic()
         while not stop_event.wait(MONITOR_INTERVAL_SECONDS):
             alive = proc.poll() is None
             sink_input_info = _pactl_sink_input_summary()
@@ -495,6 +511,14 @@ class RadioProcess:
             )
             if not alive:
                 print("gpradio-overlay: monitor: process died, stopping monitor", flush=True)
+                return
+            if time.monotonic() - started_at >= AUTO_RESTART_INTERVAL_SECONDS:
+                print("gpradio-overlay: monitor: proactive restart (workaround for unexplained stall)", flush=True)
+                # stop() first -- without it, the old gst-launch process
+                # (and its feed thread) would be orphaned rather than torn
+                # down, leaving two processes writing to the same sink.
+                self.stop()
+                self.start()
                 return
 
     def seek(self, seconds_delta):
@@ -609,7 +633,12 @@ class RadioProcess:
                             proc.stdin.write(out)
                             proc.stdin.flush()
                             total_written += len(out)
-                        except (BrokenPipeError, OSError) as exc:
+                        except (BrokenPipeError, OSError, ValueError) as exc:
+                            # ValueError ("write to closed file") happens
+                            # when stop() closes stdin while this thread is
+                            # mid-write -- a real race hit live during the
+                            # very first proactive auto-restart, confirmed
+                            # by its traceback landing in the log.
                             print("gpradio-overlay: feed write failed: %s" % exc, flush=True)
                             return
                         last_write_completed_at = time.monotonic()
