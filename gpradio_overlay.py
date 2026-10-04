@@ -85,6 +85,12 @@ MAX_RETAINED_BYTES = MAX_RETAINED_SECONDS * AUDIO_BYTES_PER_SECOND
 # periodic re-connection, not a loss of sync.
 AUTO_RESTART_INTERVAL_SECONDS = 30
 
+# How long with no successful write before treating the feed as genuinely
+# stalled (e.g. a network read timeout) and restarting immediately, instead
+# of leaving audio silent for however long is left until the next scheduled
+# proactive restart -- confirmed live, that gap was long and noticeable.
+STALL_DETECT_SECONDS = 3
+
 GST_LOG_PATH = "/tmp/f1tvgpradio-gst.log"
 MONITOR_INTERVAL_SECONDS = 2
 
@@ -431,6 +437,19 @@ class RadioProcess:
         self._total_downloaded = 0
         self._oldest_retained_pos = 0
         self._preserved_lag_seconds = 0.0
+        # Updated on every successful network read AND every write in
+        # _feed_loop (both count as "the feed is alive") -- lets
+        # _monitor_loop detect a dead feed (e.g. a network read timeout)
+        # immediately, rather than waiting for the next scheduled proactive
+        # restart. gst-launch's own process stays "alive" even once we stop
+        # feeding it (it just idles waiting for stdin), so proc.poll() alone
+        # can't catch this -- confirmed live, a network timeout left audio
+        # silent for a long, clearly-noticeable stretch before the next
+        # scheduled restart finally recovered it. Reads count too, not just
+        # writes: while an initial preserved rewind lag is being re-applied
+        # after a restart, writes are intentionally withheld for a while,
+        # which must not look like a stall.
+        self._last_activity_at = time.monotonic()
 
     def is_playing(self):
         return self._proc is not None and self._proc.poll() is None
@@ -461,6 +480,10 @@ class RadioProcess:
             self._read_pos = 0
             self._total_downloaded = 0
             self._oldest_retained_pos = 0
+            # Reset so the stall-detection check in _monitor_loop doesn't
+            # immediately see a "stale" write from the previous run while
+            # the fresh connection is still opening.
+            self._last_activity_at = time.monotonic()
         self._stop_event = threading.Event()
         # gst-launch's own stdout/stderr were previously thrown away
         # (DEVNULL) -- captured to a file now since a stutter/stop needs to
@@ -511,6 +534,18 @@ class RadioProcess:
             )
             if not alive:
                 print("gpradio-overlay: monitor: process died, stopping monitor", flush=True)
+                return
+            with self._lock:
+                write_stale_for = time.monotonic() - self._last_activity_at
+            if write_stale_for > STALL_DETECT_SECONDS:
+                print(
+                    "gpradio-overlay: monitor: feed stalled for %.1fs (e.g. a network read "
+                    "timeout) -- restarting immediately rather than waiting for the next "
+                    "scheduled restart" % write_stale_for,
+                    flush=True,
+                )
+                self.stop()
+                self.start()
                 return
             if time.monotonic() - started_at >= AUTO_RESTART_INTERVAL_SECONDS:
                 print("gpradio-overlay: monitor: proactive restart (workaround for unexplained stall)", flush=True)
@@ -578,6 +613,7 @@ class RadioProcess:
                     with self._lock:
                         self._total_downloaded += len(chunk)
                         total_downloaded = self._total_downloaded
+                        self._last_activity_at = time.monotonic()
                         if not initial_lag_applied:
                             if self._preserved_lag_seconds <= 0:
                                 initial_lag_applied = True
@@ -644,6 +680,7 @@ class RadioProcess:
                         last_write_completed_at = time.monotonic()
                         with self._lock:
                             self._read_pos += write_chunk_bytes
+                            self._last_activity_at = last_write_completed_at
                         next_write_at += write_interval_seconds
 
                     now = time.monotonic()
