@@ -155,6 +155,23 @@ KEYCODE_RED = 403  # rewind (tap 0.5s, hold 5s)
 KEYCODE_GREEN = 404  # toggle play/pause
 KEYCODE_YELLOW = 405  # toggle widget visibility (OLED burn-in guard)
 KEYCODE_BLUE = 406  # forward (tap 0.5s, hold 5s)
+# Channel up/down -- confirmed live these reach the page as plain
+# PageUp/PageDown keyCodes (not swallowed by webOS), for whoever has no
+# spare color buttons on their physical remote (e.g. driving color presses
+# through a Home Assistant widget instead). Mirrors red/blue so both
+# input paths work at once; preventDefault on these stops the page from
+# scrolling, which is all they did before this.
+KEYCODE_CH_UP = 33  # forward (tap 0.5s, hold 5s) -- same as blue
+KEYCODE_CH_DOWN = 34  # rewind (tap 0.5s, hold 5s) -- same as red
+# D-pad up/down -- confirmed live these are plain ArrowUp/ArrowDown, also
+# just scrolling the page before this. Hijacking only up/down (not
+# left/right) since that's what was actually asked for; this does mean
+# losing arrow-key menu navigation within F1TV itself while this app is
+# open, fine for pointer-based navigation. Mapped to the two toggles
+# (not rewind/forward) since they're the easiest single-press buttons to
+# reach -- CH+/CH- already covers rewind/forward.
+KEYCODE_DPAD_UP = 38  # toggle widget visibility -- same as yellow
+KEYCODE_DPAD_DOWN = 40  # toggle play/pause -- same as green
 
 PLAY_TOGGLE_MARKER = "__gpradioTogglePlay__"
 NUDGE_MARKER_PREFIX = "__gpradioNudge__"
@@ -239,6 +256,10 @@ def build_overlay_js():
   var KEYCODE_GREEN = __KEYCODE_GREEN__;
   var KEYCODE_YELLOW = __KEYCODE_YELLOW__;
   var KEYCODE_BLUE = __KEYCODE_BLUE__;
+  var KEYCODE_CH_UP = __KEYCODE_CH_UP__;
+  var KEYCODE_CH_DOWN = __KEYCODE_CH_DOWN__;
+  var KEYCODE_DPAD_UP = __KEYCODE_DPAD_UP__;
+  var KEYCODE_DPAD_DOWN = __KEYCODE_DPAD_DOWN__;
   var PLAY_TOGGLE_MARKER = __PLAY_TOGGLE_MARKER__;
   var NUDGE_MARKER_PREFIX = __NUDGE_MARKER_PREFIX__;
   var NUDGE_SMALL_SECONDS = __NUDGE_SMALL_SECONDS__;
@@ -314,13 +335,22 @@ def build_overlay_js():
     console.log(marker);
   }
   window.__gpradioKeydownHandler = function(e){
-    if (e.keyCode === KEYCODE_GREEN) {
+    if (e.keyCode === KEYCODE_GREEN || e.keyCode === KEYCODE_DPAD_DOWN) {
+      // D-pad down otherwise just scrolls the page (confirmed live).
+      if (e.keyCode === KEYCODE_DPAD_DOWN) e.preventDefault();
       fireOnce(PLAY_TOGGLE_MARKER);
-    } else if (e.keyCode === KEYCODE_YELLOW) {
+    } else if (e.keyCode === KEYCODE_YELLOW || e.keyCode === KEYCODE_DPAD_UP) {
+      // D-pad up otherwise just scrolls the page (confirmed live).
+      if (e.keyCode === KEYCODE_DPAD_UP) e.preventDefault();
       visible = !visible;
       if (window.__gpradioEls) window.__gpradioEls.wrap.style.display = visible ? 'flex' : 'none';
-    } else if (e.keyCode === KEYCODE_RED || e.keyCode === KEYCODE_BLUE) {
-      var sign = (e.keyCode === KEYCODE_RED) ? 1 : -1;
+    } else if (e.keyCode === KEYCODE_RED || e.keyCode === KEYCODE_BLUE ||
+               e.keyCode === KEYCODE_CH_UP || e.keyCode === KEYCODE_CH_DOWN) {
+      // CH+/CH- otherwise just scroll the page (confirmed live) --
+      // preventDefault stops that now that they're real controls.
+      e.preventDefault();
+      var rewindKeys = (e.keyCode === KEYCODE_RED || e.keyCode === KEYCODE_CH_DOWN);
+      var sign = rewindKeys ? 1 : -1;
       if (!e.repeat) {
         fireOnce(NUDGE_MARKER_PREFIX + JSON.stringify({seconds: sign * NUDGE_SMALL_SECONDS}));
       } else if (!holdFired[e.keyCode]) {
@@ -357,6 +387,10 @@ def build_overlay_js():
         .replace("__KEYCODE_GREEN__", str(KEYCODE_GREEN))
         .replace("__KEYCODE_YELLOW__", str(KEYCODE_YELLOW))
         .replace("__KEYCODE_BLUE__", str(KEYCODE_BLUE))
+        .replace("__KEYCODE_CH_UP__", str(KEYCODE_CH_UP))
+        .replace("__KEYCODE_CH_DOWN__", str(KEYCODE_CH_DOWN))
+        .replace("__KEYCODE_DPAD_UP__", str(KEYCODE_DPAD_UP))
+        .replace("__KEYCODE_DPAD_DOWN__", str(KEYCODE_DPAD_DOWN))
         .replace("__PLAY_TOGGLE_MARKER__", json.dumps(PLAY_TOGGLE_MARKER))
         .replace("__NUDGE_MARKER_PREFIX__", json.dumps(NUDGE_MARKER_PREFIX))
         .replace("__NUDGE_SMALL_SECONDS__", str(NUDGE_SMALL_SECONDS))

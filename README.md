@@ -52,6 +52,16 @@ going to the home screen while the radio was playing didn't stop it.
   hold for 5s. Clamped at the live edge (can't seek past "now") on one
   side and ~2 minutes of rewind room on the other.
 
+Two more button pairs work too, for remotes/setups without spare color
+buttons (e.g. driving color presses through a Home Assistant widget
+instead of the physical remote):
+
+- **Channel up/down** — same as blue/red (up = forward, down = rewind).
+- **D-pad up/down** — same as yellow/green (up = show/hide, down =
+  toggle play/pause), the two easiest single-press buttons to reach. Only
+  sensible if you navigate with the pointer rather than the D-pad, since
+  this repurposes the arrow keys within F1TV itself while the app is open.
+
 The widget shows how far behind live the radio currently is, next to the
 now-playing title.
 
