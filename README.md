@@ -86,8 +86,13 @@ format and behavior are identical here.
 
 ## Installing
 
-In Homebrew Channel, open **Add repository** and enter the latest
-release's `repo.json` URL (once a release exists), or build it yourself:
+In Homebrew Channel, open **Add repository** and enter:
+
+```
+https://github.com/ArnoldDeRuiter/f1tv-gpradio-webos/releases/latest/download/repo.json
+```
+
+or build it yourself:
 
 ```sh
 ./build.sh

@@ -1,0 +1,96 @@
+name: webOS app release
+
+# Fires on a manually-created GitHub release (tag = version, no "v" prefix
+# needed). Everything downstream is derived from the tag: appinfo.json's
+# version is written here (never bumped by hand), and repo.json is
+# generated fresh from the just-built ipk and shipped as a release asset
+# rather than committed to the repo, so it can never go stale and nothing
+# has to push back to a protected branch.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Set app version from release tag
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - "${TAG#v}" <<'EOF'
+          import json, sys
+          version = sys.argv[1]
+          with open("appinfo.json") as f:
+              data = json.load(f)
+          data["version"] = version
+          with open("appinfo.json", "w") as f:
+              json.dump(data, f, indent=4)
+              f.write("\n")
+          EOF
+
+      - name: Build ipk
+        run: ./build.sh
+
+      - name: Generate repo.json
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          IPK="$(ls ./*.ipk)"
+          HASH="$(sha256sum "$IPK" | cut -d' ' -f1)"
+          python3 - "$TAG" "$IPK" "$HASH" "$REPO" <<'EOF'
+          import json, os, sys
+
+          tag, ipk_path, sha256, repo = sys.argv[1:5]
+          version = tag[1:] if tag.startswith("v") else tag
+          ipk_name = os.path.basename(ipk_path)
+          app = json.load(open("appinfo.json"))
+
+          manifest = {
+              "id": app["id"],
+              "version": version,
+              "type": app["type"],
+              "title": app["title"],
+              "appDescription": "Unofficial F1TV + Grand Prix Radio combo -- full-screen F1TV video with a toggle-able Grand Prix Radio audio overlay widget, so both can run at once.",
+              "iconUri": f"https://raw.githubusercontent.com/{repo}/master/icon.png",
+              "sourceUrl": f"https://github.com/{repo}",
+              "rootRequired": False,
+              "ipkUrl": f"https://github.com/{repo}/releases/download/{tag}/{ipk_name}",
+              "ipkHash": {"sha256": sha256},
+          }
+          repo_json = {
+              "paging": {"page": 1, "count": 1, "maxPage": 1, "itemsTotal": 1},
+              "packages": [{
+                  "id": app["id"],
+                  "title": app["title"],
+                  "iconUri": manifest["iconUri"],
+                  "manifest": manifest,
+              }],
+          }
+          with open("repo.json", "w") as f:
+              json.dump(repo_json, f, indent=4)
+              f.write("\n")
+          EOF
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" ./*.ipk repo.json --repo "${{ github.repository }}" --clobber
