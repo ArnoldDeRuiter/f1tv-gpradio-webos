@@ -13,7 +13,7 @@
   }
   var appDir = "/media/developer/apps/usr/palm/applications/nl.arnolderuiter.f1tvgpradio";
   var startBackgroundCommand =
-    "sh " + appDir + "/kill-netflix.sh; sh " + appDir + "/start-loginfill.sh; sh " + appDir + "/start-gpradio-overlay.sh";
+    "sh " + appDir + "/kill-netflix.sh; sh " + appDir + "/kill-youtube-preload.sh; sh " + appDir + "/start-loginfill.sh; sh " + appDir + "/start-gpradio-overlay.sh";
   try {
     var bridge = new PalmServiceBridge();
     bridge.onservicecallback = go;

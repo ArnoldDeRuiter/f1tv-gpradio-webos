@@ -14,8 +14,8 @@ trap 'rm -rf "$WORK"' EXIT
 DATA_DIR="$WORK/data/$INSTALL_ROOT"
 mkdir -p "$DATA_DIR"
 cp -R appinfo.json index.html icon.png splash.png loginfill.py start-loginfill.sh \
-  kill-netflix.sh gpradio_overlay.py start-gpradio-overlay.sh "$DATA_DIR/"
-chmod +x "$DATA_DIR/start-loginfill.sh" "$DATA_DIR/kill-netflix.sh" "$DATA_DIR/start-gpradio-overlay.sh"
+  kill-netflix.sh kill-youtube-preload.sh gpradio_overlay.py start-gpradio-overlay.sh "$DATA_DIR/"
+chmod +x "$DATA_DIR/start-loginfill.sh" "$DATA_DIR/kill-netflix.sh" "$DATA_DIR/kill-youtube-preload.sh" "$DATA_DIR/start-gpradio-overlay.sh"
 
 # packageinfo.json is separate from appinfo.json and lives at a different
 # path entirely -- required by the on-device installer (appinstalld), or
