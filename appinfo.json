@@ -1,0 +1,13 @@
+{
+    "id": "nl.arnolderuiter.f1tvgpradio",
+    "version": "0.1.0",
+    "vendor": "ArnoldDeRuiter",
+    "type": "web",
+    "main": "index.html",
+    "title": "F1TV + GP Radio",
+    "icon": "icon.png",
+    "largeIcon": "icon.png",
+    "bgColor": "#e20600",
+    "iconColor": "#e20600",
+    "splashBackground": "splash.png"
+}

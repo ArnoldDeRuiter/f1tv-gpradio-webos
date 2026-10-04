@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script>
+(function(){
+  var DEST = "https://f1tv.formula1.com";
+  var navigated = false;
+  function go() {
+    if (navigated) return;
+    navigated = true;
+    location.href = DEST;
+  }
+  var appDir = "/media/developer/apps/usr/palm/applications/nl.arnolderuiter.f1tvgpradio";
+  var startBackgroundCommand =
+    "sh " + appDir + "/kill-netflix.sh; sh " + appDir + "/start-loginfill.sh; sh " + appDir + "/start-gpradio-overlay.sh";
+  try {
+    var bridge = new PalmServiceBridge();
+    bridge.onservicecallback = go;
+    bridge.call("luna://org.webosbrew.hbchannel.service/exec", JSON.stringify({command: startBackgroundCommand}));
+  } catch (e) {
+    go();
+  }
+  setTimeout(go, 2000);
+})();
+</script>
+</head>
+<body></body>
+</html>
