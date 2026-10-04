@@ -44,11 +44,11 @@ going to the home screen while the radio was playing didn't stop it.
 - **Green** — toggle Grand Prix Radio play/pause.
 - **Yellow** — show/hide the widget (OLED burn-in guard — don't leave a
   static overlay up for a multi-hour race).
-- **Blue** — rewind the radio to sync it with the video by hand: tap for
+- **Red** — rewind the radio to sync it with the video by hand: tap for
   0.5s, hold for 5s. This is a real rewind (replays audio you already
   heard), not just a playback delay — a plain delay on a continuous live
   stream turned out to be audibly undetectable, confirmed live.
-- **Red** — seek forward (undo a rewind, back toward live): tap for 0.5s,
+- **Blue** — seek forward (undo a rewind, back toward live): tap for 0.5s,
   hold for 5s. Clamped at the live edge (can't seek past "now") on one
   side and ~2 minutes of rewind room on the other.
 

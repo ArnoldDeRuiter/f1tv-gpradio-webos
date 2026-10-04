@@ -42,6 +42,7 @@ rate delay, which turned out to be audibly undetectable (confirmed live:
 it just smoothly kept playing forward with no perceptible effect at all).
 """
 
+import fcntl
 import json
 import os
 import socket
@@ -71,25 +72,27 @@ NUDGE_LARGE_SECONDS = 5.0
 MAX_RETAINED_SECONDS = 120
 MAX_RETAINED_BYTES = MAX_RETAINED_SECONDS * AUDIO_BYTES_PER_SECOND
 
-# Workaround, not a fix: audio reliably goes silent after roughly a minute
-# of play, confirmed live and repeatedly -- every layer we can inspect
-# (this process, gst-launch's own stderr, a `level` meter on the decoded
-# audio, PulseAudio's sink-input, PulseAudio's sink, the ALSA hardware
-# mixer, the raw kernel PCM clock, com.webos.audio, and webOS's own
-# structured notification log) reports perfectly healthy at the exact
-# moment it goes silent -- see TODO.md for the full investigation. A full
-# restart of the gst-launch subprocess reliably recovers it, so this
-# restarts proactively before that point rather than waiting to notice and
-# press green. The rewind/seek position survives the restart (see
-# start()'s _preserved_lag_seconds handling), so this is just a brief,
-# periodic re-connection, not a loss of sync.
-AUTO_RESTART_INTERVAL_SECONDS = 30
-
 # How long with no successful write before treating the feed as genuinely
 # stalled (e.g. a network read timeout) and restarting immediately, instead
 # of leaving audio silent for however long is left until the next scheduled
 # proactive restart -- confirmed live, that gap was long and noticeable.
 STALL_DETECT_SECONDS = 3
+
+# Root cause of the long-standing stall, found and fixed live (2026-10-04):
+# this stream is VBR (confirmed via alsasink's own tag messages reporting a
+# different bitrate -- 128053, 128720, 96296, 190008... -- each time), but
+# writes used to be paced against a hand-picked FIXED bytes/sec estimate.
+# That mismatch accumulates drift against gst's own small queue (needed to
+# keep rewind/seek responsive) until something gives, consistently around a
+# minute in. Fix: don't guess a rate at all -- shrink the OS pipe so a real
+# blocking write() paces us to gst's own actual consumption rate, the same
+# way souphttpsrc (which never had this bug) does it internally. Isolated
+# and confirmed live: a bare `souphttpsrc`-fed pipeline never stalled (3+
+# minutes); a from-scratch fixed-rate-paced `fdsrc` feeder (no rewind code
+# at all) reproduced the stall; this blocking-write approach ran 3.5+
+# minutes clean.
+F_SETPIPE_SZ = 1031  # Linux-specific fcntl constant, not always exposed by name
+SHRUNK_PIPE_SIZE_BYTES = 8192
 
 GST_LOG_PATH = "/tmp/f1tvgpradio-gst.log"
 MONITOR_INTERVAL_SECONDS = 2
@@ -132,10 +135,10 @@ GST_FEED_CMD = [
 # preventDefault/stopPropagation on these in the injected JS -- if F1TV's
 # own page also binds one of them for something, that should keep working
 # too; this is a judgment call to revisit if live testing shows a conflict.
-KEYCODE_RED = 403  # nudge sync earlier (tap -0.5s, hold -5s)
+KEYCODE_RED = 403  # rewind (tap 0.5s, hold 5s)
 KEYCODE_GREEN = 404  # toggle play/pause
 KEYCODE_YELLOW = 405  # toggle widget visibility (OLED burn-in guard)
-KEYCODE_BLUE = 406  # nudge sync later (tap +0.5s, hold +5s)
+KEYCODE_BLUE = 406  # forward (tap 0.5s, hold 5s)
 
 PLAY_TOGGLE_MARKER = "__gpradioTogglePlay__"
 NUDGE_MARKER_PREFIX = "__gpradioNudge__"
@@ -213,9 +216,9 @@ def build_overlay_js():
     # as format specifiers ("not enough arguments for format string").
     template = """
 (function(){
-  if (window.__gpradioOverlayInstalled) return;
-  window.__gpradioOverlayInstalled = true;
-
+  // No early return here on purpose -- see the listener-reattachment
+  // comment further down for why. Only the DOM (`build()`) is guarded
+  // against duplication, further below.
   var KEYCODE_RED = __KEYCODE_RED__;
   var KEYCODE_GREEN = __KEYCODE_GREEN__;
   var KEYCODE_YELLOW = __KEYCODE_YELLOW__;
@@ -257,33 +260,80 @@ def build_overlay_js():
   // happen in the daemon (plain root process, not subject to F1TV's CSP) --
   // this page-side code only shows state and relays key presses back to it
   // via a console marker, the same signalling technique loginfill.py uses.
-  window.__gpradioEls = build();
+  function init() {
+    window.__gpradioOverlayInstalled = true;
+    window.__gpradioEls = build();
+  }
+
+  // Re-attaches fresh listeners on every single execution of this script,
+  // explicitly removing any previous copy first via a named function
+  // stashed on window -- confirmed live, and the actual cause of a real
+  // bug: across this app's many daemon restarts over a long session,
+  // multiple copies of this script ended up attached to the page at once
+  // (ten duplicate listeners observed for one real keydown), each firing
+  // independently, which looked exactly like "presses do nothing, then
+  // suddenly jump" once enough of them piled up. The __gpradioOverlayInstalled
+  // guard below only stops the DOM (`build()`) from being duplicated; it
+  // doesn't stop listeners from accumulating, since whatever webOS-specific
+  // CDP quirk causes re-injection runs this whole script again regardless.
   var visible = true;
   var holdFired = {};
-
-  document.addEventListener('keydown', function(e){
+  if (window.__gpradioKeydownHandler) {
+    document.removeEventListener('keydown', window.__gpradioKeydownHandler);
+  }
+  if (window.__gpradioKeyupHandler) {
+    document.removeEventListener('keyup', window.__gpradioKeyupHandler);
+  }
+  // Belt-and-suspenders against still-not-fully-understood duplicate listener
+  // accumulation (confirmed live: up to 3 copies fired for one real keydown
+  // even after the remove-then-reattach fix above) -- window.__gpradioLastFire
+  // is shared across every duplicate closure, so collapse any same-marker
+  // fire within a tight window into a single actual console.log.
+  if (!window.__gpradioLastFire) window.__gpradioLastFire = {};
+  function fireOnce(marker) {
+    var now = Date.now();
+    var last = window.__gpradioLastFire[marker] || 0;
+    if (now - last < 50) return;
+    window.__gpradioLastFire[marker] = now;
+    console.log(marker);
+  }
+  window.__gpradioKeydownHandler = function(e){
     if (e.keyCode === KEYCODE_GREEN) {
-      console.log(PLAY_TOGGLE_MARKER);
+      fireOnce(PLAY_TOGGLE_MARKER);
     } else if (e.keyCode === KEYCODE_YELLOW) {
       visible = !visible;
-      window.__gpradioEls.wrap.style.display = visible ? 'flex' : 'none';
+      if (window.__gpradioEls) window.__gpradioEls.wrap.style.display = visible ? 'flex' : 'none';
     } else if (e.keyCode === KEYCODE_RED || e.keyCode === KEYCODE_BLUE) {
-      var sign = (e.keyCode === KEYCODE_BLUE) ? 1 : -1;
+      var sign = (e.keyCode === KEYCODE_RED) ? 1 : -1;
       if (!e.repeat) {
-        console.log(NUDGE_MARKER_PREFIX + JSON.stringify({seconds: sign * NUDGE_SMALL_SECONDS}));
+        fireOnce(NUDGE_MARKER_PREFIX + JSON.stringify({seconds: sign * NUDGE_SMALL_SECONDS}));
       } else if (!holdFired[e.keyCode]) {
         // e.repeat fires repeatedly for as long as a key is physically
         // held (native browser key-repeat) -- only fire the bigger hold
         // jump once per hold, not once per repeat tick.
         holdFired[e.keyCode] = true;
-        console.log(NUDGE_MARKER_PREFIX + JSON.stringify({seconds: sign * NUDGE_LARGE_SECONDS}));
+        fireOnce(NUDGE_MARKER_PREFIX + JSON.stringify({seconds: sign * NUDGE_LARGE_SECONDS}));
       }
     }
-  });
-
-  document.addEventListener('keyup', function(e){
+  };
+  window.__gpradioKeyupHandler = function(e){
     holdFired[e.keyCode] = false;
-  });
+  };
+  document.addEventListener('keydown', window.__gpradioKeydownHandler);
+  document.addEventListener('keyup', window.__gpradioKeyupHandler);
+
+  // document.body doesn't exist yet when this runs via
+  // Page.addScriptToEvaluateOnNewDocument at the very start of a fresh
+  // navigation -- confirmed live: build()'s appendChild threw, leaving
+  // __gpradioOverlayInstalled set but __gpradioEls never assigned, so the
+  // whole widget silently never appeared and green/yellow did nothing.
+  if (!window.__gpradioOverlayInstalled) {
+    if (document.body) {
+      init();
+    } else {
+      document.addEventListener('DOMContentLoaded', init);
+    }
+  }
 })();
 """
     return (
@@ -437,18 +487,30 @@ class RadioProcess:
         self._total_downloaded = 0
         self._oldest_retained_pos = 0
         self._preserved_lag_seconds = 0.0
-        # Updated on every successful network read AND every write in
-        # _feed_loop (both count as "the feed is alive") -- lets
+        # Clean, explicit record of what the user actually asked for via
+        # rewind/forward, separate from (total_downloaded - read_pos) --
+        # that raw snapshot conflates the real seek with incidental
+        # buffering jitter between the independent read/write threads
+        # (confirmed live: ~0.1-0.4s of drift exists even with zero button
+        # presses), which is why a tap used to show "+0.6s" instead of a
+        # clean "+1.0s" on the second press.
+        self._intentional_offset_seconds = 0.0
+        # Shared between _read_loop (appends/trims) and _write_loop (reads
+        # slices out of it) -- both run as independent threads so a slow
+        # gst write() blocking can never stop network reads from draining
+        # the socket promptly (see _write_loop's docstring for why that
+        # matters).
+        self._retained = bytearray()
+        # Updated on every successful network read (_read_loop) AND every
+        # write (_write_loop) -- both count as "the feed is alive" -- lets
         # _monitor_loop detect a dead feed (e.g. a network read timeout)
-        # immediately, rather than waiting for the next scheduled proactive
-        # restart. gst-launch's own process stays "alive" even once we stop
-        # feeding it (it just idles waiting for stdin), so proc.poll() alone
-        # can't catch this -- confirmed live, a network timeout left audio
-        # silent for a long, clearly-noticeable stretch before the next
-        # scheduled restart finally recovered it. Reads count too, not just
-        # writes: while an initial preserved rewind lag is being re-applied
-        # after a restart, writes are intentionally withheld for a while,
-        # which must not look like a stall.
+        # immediately. gst-launch's own process stays "alive" even once we
+        # stop feeding it (it just idles waiting for stdin), so proc.poll()
+        # alone can't catch this -- confirmed live, a network timeout left
+        # audio silent for a long, clearly-noticeable stretch otherwise.
+        # Reads count too, not just writes: while an initial preserved
+        # rewind lag is being re-applied after a restart, writes are
+        # intentionally withheld for a while, which must not look stalled.
         self._last_activity_at = time.monotonic()
 
     def is_playing(self):
@@ -463,22 +525,22 @@ class RadioProcess:
 
     def current_lag_seconds(self):
         with self._lock:
-            return (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
+            return self._intentional_offset_seconds
 
     def start(self):
         with self._lock:
             # Preserve how far behind live we currently are -- a restart
-            # (via the green-button toggle) is the only reliable recovery
-            # from the still-unexplained stall where every diagnostic layer
-            # we can inspect reports healthy, yet no audio reaches the
-            # speaker. A restart tears down the retained buffer entirely
-            # (fresh connection, fresh download from scratch), so the exact
-            # bytes can't carry over, but the SECONDS-behind-live value can
-            # be re-applied once the fresh feed has downloaded enough to
-            # support it -- see _feed_loop's initial_lag_applied handling.
-            self._preserved_lag_seconds = (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
+            # (e.g. the green-button toggle, or the stall-detector recovering
+            # from a genuine network hiccup) tears down the retained buffer
+            # entirely (fresh connection, fresh download from scratch), so
+            # the exact bytes can't carry over, but the SECONDS-behind-live
+            # value can be re-applied once the fresh feed has downloaded
+            # enough to support it -- see _write_loop's initial_lag_applied
+            # handling.
+            self._preserved_lag_seconds = self._intentional_offset_seconds
             self._read_pos = 0
             self._total_downloaded = 0
+            self._retained = bytearray()
             self._oldest_retained_pos = 0
             # Reset so the stall-detection check in _monitor_loop doesn't
             # immediately see a "stale" write from the previous run while
@@ -495,8 +557,18 @@ class RadioProcess:
             stdout=gst_log,
             stderr=gst_log,
         )
+        # Shrink the OS pipe backing stdin so a real write() blocks
+        # promptly (within a fraction of a second) once gst's own small
+        # queue is full, instead of silently absorbing several seconds of
+        # backlog first (the Linux default is ~64KB). This is what actually
+        # fixes the long-standing stall/silence bug -- see _write_loop's own
+        # comment for the full story.
+        fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, SHRUNK_PIPE_SIZE_BYTES)
         threading.Thread(
-            target=self._feed_loop, args=(self._proc, self._stop_event), daemon=True
+            target=self._read_loop, args=(self._stop_event,), daemon=True
+        ).start()
+        threading.Thread(
+            target=self._write_loop, args=(self._proc, self._stop_event), daemon=True
         ).start()
         threading.Thread(
             target=self._monitor_loop, args=(self._proc, self._stop_event), daemon=True
@@ -514,15 +586,13 @@ class RadioProcess:
             self._proc = None
 
     def _monitor_loop(self, proc, stop_event):
-        """Independent of the write-pacing loop on purpose -- polls
-        PulseAudio's own view of our stream (corked/muted/which sink) plus
-        process liveness and system load, so a stutter/stop shows up here
-        even if the feed loop itself looks perfectly healthy throughout
-        (confirmed live: it did, during a real stutter -- the fault must be
-        downstream of our write() calls, in gst/PulseAudio/ALSA, not in the
-        feeder itself). Also proactively restarts the subprocess on a timer
-        -- see AUTO_RESTART_INTERVAL_SECONDS."""
-        started_at = time.monotonic()
+        """Independent of the feed loop on purpose -- polls PulseAudio's own
+        view of our stream (corked/muted/which sink), process liveness, and
+        system load for general diagnostics, and restarts immediately if the
+        feed goes quiet for too long (STALL_DETECT_SECONDS) -- e.g. a
+        genuine network read timeout, confirmed live as a real, occasional
+        occurrence distinct from (and still present after fixing) the main
+        stall bug."""
         while not stop_event.wait(MONITOR_INTERVAL_SECONDS):
             alive = proc.poll() is None
             sink_input_info = _pactl_sink_input_summary()
@@ -540,15 +610,9 @@ class RadioProcess:
             if write_stale_for > STALL_DETECT_SECONDS:
                 print(
                     "gpradio-overlay: monitor: feed stalled for %.1fs (e.g. a network read "
-                    "timeout) -- restarting immediately rather than waiting for the next "
-                    "scheduled restart" % write_stale_for,
+                    "timeout) -- restarting immediately" % write_stale_for,
                     flush=True,
                 )
-                self.stop()
-                self.start()
-                return
-            if time.monotonic() - started_at >= AUTO_RESTART_INTERVAL_SECONDS:
-                print("gpradio-overlay: monitor: proactive restart (workaround for unexplained stall)", flush=True)
                 # stop() first -- without it, the old gst-launch process
                 # (and its feed thread) would be orphaned rather than torn
                 # down, leaving two processes writing to the same sink.
@@ -566,39 +630,36 @@ class RadioProcess:
         nothing" (confirmed live: a gradually-approached target lag doesn't
         replay anything, it just briefly withholds new content)."""
         with self._lock:
-            delta_bytes = -int(seconds_delta * AUDIO_BYTES_PER_SECOND)
-            new_pos = self._read_pos + delta_bytes
+            # Target computed from the clean intentional counter and the
+            # current live edge -- not from self._read_pos, which drifts
+            # slightly from the raw lag on its own (see __init__ comment).
+            self._intentional_offset_seconds += seconds_delta
+            wanted_bytes = int(self._intentional_offset_seconds * AUDIO_BYTES_PER_SECOND)
+            new_pos = self._total_downloaded - wanted_bytes
             new_pos = max(self._oldest_retained_pos, min(new_pos, self._total_downloaded))
             self._read_pos = new_pos
-            return (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
+            # Resync the counter to what was actually achievable (clamped at
+            # the retained-buffer edge or live) so it never silently drifts
+            # from reality.
+            self._intentional_offset_seconds = (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
+            return self._intentional_offset_seconds
 
-    def _feed_loop(self, proc, stop_event):
-        # No "Icy-MetaData: 1" request header is sent (default urllib
-        # behaviour), so the server sends a clean AAC byte stream with no
-        # interleaved ICY metadata chunks to worry about.
-        #
-        # Keeps a sliding window of the last MAX_RETAINED_SECONDS of
-        # downloaded bytes (`retained`) and an absolute, independently
-        # movable read position (`self._read_pos`) into the conceptual
-        # (never-reset) downloaded stream -- real DVR-style rewind, not
-        # just a release-rate delay. Writes are explicitly paced to
-        # real-time via time.sleep() regardless of how far read_pos is
-        # from the live edge, rather than relying on write() blocking once
-        # downstream is "full" -- confirmed live that it doesn't block in
-        # time to matter, since the OS pipe backing subprocess.PIPE has its
-        # own several-seconds buffer sitting between us and gst.
-        retained = bytearray()
-        write_chunk_bytes = 2048
-        write_interval_seconds = write_chunk_bytes / AUDIO_BYTES_PER_SECOND
-        next_write_at = time.monotonic()
-        last_write_completed_at = time.monotonic()
+    def _read_loop(self, stop_event):
+        """Only fetches from the network and appends to self._retained --
+        deliberately separate from _write_loop (which can block for a while
+        on purpose, see its docstring) so a slow gst write() can never stop
+        this from draining the socket promptly. Confirmed live that sharing
+        one thread between the two caused read timeouts to start firing
+        every ~10-15s once writes started blocking on gst's real pace: this
+        thread would miss its own read window while stuck in a blocking
+        write, the kernel's TCP receive buffer would fill, flow control
+        would make the server stop sending, and urlopen's own read timeout
+        would eventually fire -- a new failure mode, not the original bug.
+
+        No "Icy-MetaData: 1" request header is sent (default urllib
+        behaviour), so the server sends a clean AAC byte stream with no
+        interleaved ICY metadata chunks to worry about."""
         total_read = 0
-        total_written = 0
-        max_write_gap_seen = 0.0
-        last_debug_print = time.monotonic()
-        # Gates writing until a preserved lag (from a prior run, before a
-        # restart) can actually be satisfied -- see start()'s comment.
-        initial_lag_applied = False
         try:
             with urllib.request.urlopen(STREAM_URL, timeout=10) as resp:
                 print("gpradio-overlay: feed opened, status=%s url=%s" % (resp.status, resp.geturl()), flush=True)
@@ -606,97 +667,126 @@ class RadioProcess:
                     chunk = resp.read(4096)
                     if not chunk:
                         print("gpradio-overlay: feed got empty chunk, stream ended", flush=True)
-                        break
+                        return
                     total_read += len(chunk)
-                    retained.extend(chunk)
-
                     with self._lock:
+                        self._retained.extend(chunk)
                         self._total_downloaded += len(chunk)
-                        total_downloaded = self._total_downloaded
                         self._last_activity_at = time.monotonic()
-                        if not initial_lag_applied:
-                            if self._preserved_lag_seconds <= 0:
-                                initial_lag_applied = True
-                            else:
-                                wanted_lag_bytes = int(self._preserved_lag_seconds * AUDIO_BYTES_PER_SECOND)
-                                if total_downloaded >= wanted_lag_bytes:
-                                    self._read_pos = total_downloaded - wanted_lag_bytes
-                                    initial_lag_applied = True
-
-                    # Trim the retained window, but never past the current
-                    # read position -- that would destroy audio a rewind
-                    # still needs.
-                    excess = len(retained) - MAX_RETAINED_BYTES
-                    if excess > 0:
-                        with self._lock:
+                        # Trim the retained window, but never past the
+                        # current read position -- that would destroy audio
+                        # a rewind still needs.
+                        excess = len(self._retained) - MAX_RETAINED_BYTES
+                        if excess > 0:
                             trim = min(excess, max(0, self._read_pos - self._oldest_retained_pos))
-                        if trim > 0:
-                            del retained[:trim]
-                            with self._lock:
+                            if trim > 0:
+                                del self._retained[:trim]
                                 self._oldest_retained_pos += trim
-
-                    if not initial_lag_applied:
-                        continue
-
-                    while True:
-                        with self._lock:
-                            read_pos = self._read_pos
-                            oldest = self._oldest_retained_pos
-                            total_downloaded = self._total_downloaded
-                        available = total_downloaded - read_pos
-                        if available < write_chunk_bytes:
-                            break
-                        now = time.monotonic()
-                        if now < next_write_at:
-                            time.sleep(next_write_at - now)
-                        # Gap since the PREVIOUS actual write, not the
-                        # scheduled one -- reveals real thread-scheduling
-                        # stalls (e.g. CPU contention from F1TV's own video
-                        # decode) that the schedule-based `next_write_at`
-                        # bookkeeping alone wouldn't surface.
-                        write_gap = time.monotonic() - last_write_completed_at
-                        if write_gap > max_write_gap_seen:
-                            max_write_gap_seen = write_gap
-                        if write_gap > write_interval_seconds * 5:
-                            print(
-                                "gpradio-overlay: feed WARNING: write stalled for %.2fs (expected ~%.3fs)"
-                                % (write_gap, write_interval_seconds),
-                                flush=True,
-                            )
-                        rel_start = read_pos - oldest
-                        out = bytes(retained[rel_start:rel_start + write_chunk_bytes])
-                        try:
-                            proc.stdin.write(out)
-                            proc.stdin.flush()
-                            total_written += len(out)
-                        except (BrokenPipeError, OSError, ValueError) as exc:
-                            # ValueError ("write to closed file") happens
-                            # when stop() closes stdin while this thread is
-                            # mid-write -- a real race hit live during the
-                            # very first proactive auto-restart, confirmed
-                            # by its traceback landing in the log.
-                            print("gpradio-overlay: feed write failed: %s" % exc, flush=True)
-                            return
-                        last_write_completed_at = time.monotonic()
-                        with self._lock:
-                            self._read_pos += write_chunk_bytes
-                            self._last_activity_at = last_write_completed_at
-                        next_write_at += write_interval_seconds
-
-                    now = time.monotonic()
-                    if now - last_debug_print >= 2:
-                        with self._lock:
-                            lag = (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
-                        print(
-                            "gpradio-overlay: feed debug: read=%d written=%d retained_bytes=%d "
-                            "lag_seconds=%.2f max_write_gap=%.2fs"
-                            % (total_read, total_written, len(retained), lag, max_write_gap_seen),
-                            flush=True,
-                        )
-                        last_debug_print = now
         except OSError as exc:
             print("gpradio-overlay: feed urlopen/read failed: %s" % exc, flush=True)
             return
+
+    def _write_loop(self, proc, stop_event):
+        """Only writes self._retained (from self._read_pos) into proc's
+        stdin -- see _read_loop's docstring for why this is a separate
+        thread from the network read.
+
+        Writes are NOT paced against a hand-picked bytes/sec estimate (that
+        was the original bug -- this stream is VBR, confirmed via
+        alsasink's own tag messages reporting a different bitrate each
+        time, so any fixed rate drifts against real consumption until
+        gst's own small queue -- needed to keep rewind/seek responsive --
+        can't absorb the difference, reliably breaking after about a
+        minute). Instead, start() shrinks the OS pipe behind proc.stdin so
+        a plain blocking write() paces us to gst's own actual consumption
+        rate, same as souphttpsrc does internally -- confirmed live that
+        this alone fixes it (3.5+ minutes clean vs. consistently ~60s)."""
+        write_chunk_bytes = 2048
+        total_written = 0
+        max_write_gap_seen = 0.0
+        last_debug_print = time.monotonic()
+        # Gates writing until a preserved lag (from a prior run, before a
+        # restart) can actually be satisfied -- see start()'s comment.
+        initial_lag_applied = False
+        while not stop_event.is_set():
+            with self._lock:
+                if not initial_lag_applied:
+                    if self._preserved_lag_seconds <= 0:
+                        initial_lag_applied = True
+                    else:
+                        wanted_lag_bytes = int(self._preserved_lag_seconds * AUDIO_BYTES_PER_SECOND)
+                        if self._total_downloaded >= wanted_lag_bytes:
+                            self._read_pos = self._total_downloaded - wanted_lag_bytes
+                            initial_lag_applied = True
+                if initial_lag_applied:
+                    read_pos = self._read_pos
+                    oldest = self._oldest_retained_pos
+                    available = self._total_downloaded - read_pos
+                else:
+                    available = 0
+            if available < write_chunk_bytes:
+                # Nothing to send yet -- waiting on the reader to bring in
+                # more data, or on the preserved-lag warmup above. A short
+                # sleep avoids busy-spinning; this is not what paces real
+                # playback (the blocking write() below is).
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                rel_start = self._read_pos - self._oldest_retained_pos
+                out = bytes(self._retained[rel_start:rel_start + write_chunk_bytes])
+            write_started_at = time.monotonic()
+            try:
+                # Blocks here once the shrunk pipe + gst's small queue are
+                # full -- that's deliberate, it's what paces us to gst's
+                # real consumption rate.
+                proc.stdin.write(out)
+                proc.stdin.flush()
+                total_written += len(out)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                # ValueError ("write to closed file") happens when stop()
+                # closes stdin while this thread is mid-write -- a real
+                # race hit live during a restart, confirmed by its
+                # traceback landing in the log.
+                print("gpradio-overlay: feed write failed: %s" % exc, flush=True)
+                return
+            write_completed_at = time.monotonic()
+            # How long this one write() call itself took to unblock -- a
+            # healthy run should see this stay small and fairly steady; a
+            # sustained jump would indicate real downstream trouble.
+            write_gap = write_completed_at - write_started_at
+            if write_gap > max_write_gap_seen:
+                max_write_gap_seen = write_gap
+            with self._lock:
+                self._read_pos += write_chunk_bytes
+                self._last_activity_at = write_completed_at
+
+            now = time.monotonic()
+            if now - last_debug_print >= 2:
+                with self._lock:
+                    lag = (self._total_downloaded - self._read_pos) / AUDIO_BYTES_PER_SECOND
+                    retained_len = len(self._retained)
+                print(
+                    "gpradio-overlay: feed debug: written=%d retained_bytes=%d "
+                    "lag_seconds=%.2f max_write_gap=%.2fs"
+                    % (total_written, retained_len, lag, max_write_gap_seen),
+                    flush=True,
+                )
+                last_debug_print = now
+
+
+def _nowplaying_poll_loop(title_holder, stop_event):
+    """Runs the slow part (an external HTTP fetch) on its own thread, purely
+    writing the result into title_holder -- the actual CDP push still
+    happens on _watch_target's own thread, which owns the only WebSocket
+    connection to the page (reading/writing a single WebSocket from two
+    threads at once would garble frame parsing, so this thread never
+    touches `sock` at all). Confirmed live that NOT doing this split caused
+    a real, noticeable bug: a slow fetch here blocked _watch_target from
+    reading the CDP socket at all, so any button presses made during that
+    window just sat unread until the fetch finished, then all landed at
+    once -- looked exactly like "presses queue up, then suddenly jump"."""
+    while not stop_event.wait(NOWPLAYING_POLL_SECONDS):
+        title_holder[0] = _fetch_now_playing()
 
 
 def _watch_target(target, overlay_js):
@@ -709,6 +799,11 @@ def _watch_target(target, overlay_js):
     path = ws_url.split(CDP_HOST + ":" + str(CDP_PORT), 1)[1]
     sock = socket.create_connection((CDP_HOST, CDP_PORT), timeout=10)
     radio = RadioProcess()
+    nowplaying_stop_event = threading.Event()
+    title_holder = [_fetch_now_playing()]
+    threading.Thread(
+        target=_nowplaying_poll_loop, args=(title_holder, nowplaying_stop_event), daemon=True
+    ).start()
     try:
         _handshake(sock, CDP_HOST, CDP_PORT, path)
         _call(sock, 1, "Page.enable")
@@ -718,13 +813,11 @@ def _watch_target(target, overlay_js):
         print("gpradio-overlay: injected into target %s" % target_id, flush=True)
 
         sock.settimeout(2)
-        next_nowplaying_fetch = 0
+        pushed_title = None
         while True:
-            now = time.time()
-            if now >= next_nowplaying_fetch:
-                title = _fetch_now_playing()
-                _call(sock, 5, "Runtime.evaluate", {"expression": _set_label_js(title)})
-                next_nowplaying_fetch = now + NOWPLAYING_POLL_SECONDS
+            if title_holder[0] != pushed_title:
+                pushed_title = title_holder[0]
+                _call(sock, 5, "Runtime.evaluate", {"expression": _set_label_js(pushed_title)})
 
             try:
                 opcode, payload = _recv_frame(sock)
@@ -735,6 +828,8 @@ def _watch_target(target, overlay_js):
             if opcode != 0x1:
                 continue
             value = _console_message_value(payload)
+            if value is not None:
+                print("gpradio-overlay: console message received at t=%.3f: %r" % (time.time(), value), flush=True)
             if value == PLAY_TOGGLE_MARKER:
                 now_playing = radio.toggle()
                 _call(sock, 6, "Runtime.evaluate", {"expression": _set_indicator_js(now_playing)})
@@ -752,6 +847,7 @@ def _watch_target(target, overlay_js):
         print("gpradio-overlay: target %s connection ended: %s" % (target_id, exc), flush=True)
         return "error"
     finally:
+        nowplaying_stop_event.set()
         radio.stop()
         try:
             sock.close()
