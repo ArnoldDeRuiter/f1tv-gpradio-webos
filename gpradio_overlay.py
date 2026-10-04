@@ -102,6 +102,20 @@ GST_FEED_CMD = [
     "-m",  # print bus messages (incl. the `level` element's RMS/peak) to stdout
     "fdsrc",
     "fd=0",
+    # do-timestamp=true was tried here so queue's max-size-time below could
+    # measure elapsed time at all (untimestamped buffers made it silently
+    # never trigger, confirmed as the cause of a rewind only becoming
+    # audible ~10s after pressing the button). But fdsrc's do-timestamp
+    # stamps buffers by WALL-CLOCK ARRIVAL time, not actual audio duration
+    # -- our write_loop writes in bursts (catching up after any delay), so
+    # several seconds of real audio can arrive within milliseconds of each
+    # other, making the queue think it's nearly empty when it's actually
+    # holding seconds of content. Confirmed live: real audible stuttering
+    # started right after adding this. Fixed properly below instead by
+    # moving queue after aacparse, which stamps buffers from the decoded
+    # AAC frame headers -- accurate regardless of how bursty our writes are.
+    "!",
+    "aacparse",
     "!",
     # Without this, decodebin/alsasink maintain their own multi-second
     # internal buffer -- confirmed live: nudging the delay target updated
@@ -109,12 +123,14 @@ GST_FEED_CMD = [
     # upstream pacing changes were just absorbed into that existing slack
     # instead of reaching the actual output. Capping it here forces our
     # feed-rate changes to propagate to real playback within ~0.3s instead.
+    # Sits after aacparse (not before, via do-timestamp) so its time-based
+    # accounting is driven by real decoded-frame timestamps.
     "queue",
     "max-size-time=300000000",  # 0.3s, in nanoseconds
     "max-size-buffers=0",
     "max-size-bytes=0",
     "!",
-    "decodebin",
+    "avdec_aac",
     "!",
     "audioconvert",
     "!",
@@ -564,6 +580,19 @@ class RadioProcess:
         # fixes the long-standing stall/silence bug -- see _write_loop's own
         # comment for the full story.
         fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, SHRUNK_PIPE_SIZE_BYTES)
+        # Protect gst-launch from this TV's own heavy CPU contention
+        # (F1TV's video decode routinely keeps load1 around 17) -- without
+        # this, a scheduling delay at the ALSA/hardware layer can clip
+        # audio for a moment without showing up as an error anywhere in
+        # gst's own bookkeeping, confirmed live as real, audible stutter
+        # with an otherwise completely healthy-looking pipeline. Real-time
+        # FIFO priority lets it preempt normal (SCHED_OTHER) processes
+        # when it actually needs the CPU.
+        try:
+            os.setpriority(os.PRIO_PROCESS, self._proc.pid, -15)
+            os.sched_setscheduler(self._proc.pid, os.SCHED_FIFO, os.sched_param(10))
+        except OSError as exc:
+            print("gpradio-overlay: failed to raise gst-launch priority: %s" % exc, flush=True)
         threading.Thread(
             target=self._read_loop, args=(self._stop_event,), daemon=True
         ).start()
