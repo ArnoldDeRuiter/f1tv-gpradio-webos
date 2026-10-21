@@ -16,8 +16,8 @@ time) -- this daemon runs as root already (same exec-bridge launch as
 scrollfix.py) so it can read a root-only credentials file with no
 additional privilege needed.
 
-Only fills the two real login fields (input[name="Login"] and
-input[name="Password"] -- confirmed live via CDP inspection of the actual
+Only fills the two real login fields (input[name="username"]/"Login" and
+input[name="password"]/"Password" -- confirmed live via CDP inspection of the actual
 account.formula1.com React app, which renders several other same-page
 forms -- forgot-password, reset-password, sign-up -- using different field
 names). Never touches or clicks the sign-in button; that stays a manual,
@@ -132,8 +132,8 @@ def build_fill_js(username, password):
 
   function tryFill() {
     if (filled) return;
-    var userField = document.querySelector('input[name="Login"]');
-    var passField = document.querySelector('input[name="Password"]');
+    var userField = document.querySelector('input[name="username"], input[name="Login"]');
+    var passField = document.querySelector('input[name="password"], input[name="Password"]');
     if (!userField || !passField) return;
     if (userField.value || passField.value) return;
     setReactInputValue(userField, username);
